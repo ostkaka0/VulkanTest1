@@ -5,7 +5,15 @@
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
 
-
+#define GET_INSTANCE_PROC_ADDR(inst, entrypoint)                               \
+    {                                                                          \
+        g_vkFP##entrypoint =                                                   \
+            (PFN_vk##entrypoint)vkGetInstanceProcAddr(inst, "vk" #entrypoint); \
+        if (g_vkFP##entrypoint == NULL) {                                      \
+            error("vkGetInstanceProcAddr failed to find vk" #entrypoint        \
+			      "\n vkGetInstanceProcAddr Failure");                         \
+        }                                                                      \
+    }
 
 void error(std::string error) {
 	std::cout << error << std::endl;
@@ -17,9 +25,25 @@ std::vector<const char*> g_validationLayers;
 std::vector<const char*> g_extensions;
 VkInstance g_vkInstance;
 VkPhysicalDevice g_vkGPU;
+VkPhysicalDeviceProperties g_vkGPUProperties;
+std::vector<VkQueueFamilyProperties> g_vkQueueProperties;
+
 GLFWwindow* g_window = nullptr;
 int g_width = 800;
 int g_height = 600;
+
+PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR g_vkFPGetPhysicalDeviceSurfaceCapabilitiesKHR;
+PFN_vkGetPhysicalDeviceSurfaceFormatsKHR g_vkFPGetPhysicalDeviceSurfaceFormatsKHR;
+PFN_vkGetPhysicalDeviceSurfacePresentModesKHR g_vkFPGetPhysicalDeviceSurfacePresentModesKHR;
+PFN_vkGetPhysicalDeviceSurfaceSupportKHR g_vkFPGetPhysicalDeviceSurfaceSupportKHR;
+PFN_vkCreateSwapchainKHR g_vkFPCreateSwapchainKHR;
+PFN_vkDestroySwapchainKHR g_vkFPDestroySwapchainKHR;
+PFN_vkGetSwapchainImagesKHR g_vkFPGetSwapchainImagesKHR;
+PFN_vkAcquireNextImageKHR g_vkFPAcquireNextImageKHR;;
+PFN_vkQueuePresentKHR g_vkFPQueuePresentKHR;
+
+VkSurfaceKHR g_vkSurface;
+uint32_t g_vkGraphicsQueueNodeIndex;
 
 int main(int argc, char** argv) {
 	
@@ -206,6 +230,19 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	// Get queue properties
+	{
+		uint32_t numQueues;
+		vkGetPhysicalDeviceProperties(g_vkGPU, &g_vkGPUProperties);
+
+		vkGetPhysicalDeviceQueueFamilyProperties(g_vkGPU, &numQueues, nullptr);
+		if (numQueues == 0)
+			error("vkGetPhysicalDeviceQueueFamilyProperties could not find any queues.");
+
+		g_vkQueueProperties = std::vector<VkQueueFamilyProperties>(numQueues);
+		vkGetPhysicalDeviceQueueFamilyProperties(g_vkGPU, &numQueues, g_vkQueueProperties.data());
+	}
+
 	// Look for device layers (Unecessary code that does nothing)
 	{
 		uint32_t numDeviceLayers;
@@ -257,6 +294,19 @@ int main(int argc, char** argv) {
 
 	// TODO: Validate
 
+	// Get instance function adresses
+	{
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, GetPhysicalDeviceSurfaceCapabilitiesKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, GetPhysicalDeviceSurfaceFormatsKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, GetPhysicalDeviceSurfacePresentModesKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, GetPhysicalDeviceSurfaceSupportKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, CreateSwapchainKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, DestroySwapchainKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, GetSwapchainImagesKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, AcquireNextImageKHR);
+		GET_INSTANCE_PROC_ADDR(g_vkInstance, QueuePresentKHR);
+	}
+
 	// Create window
 	{
 		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -280,6 +330,59 @@ int main(int argc, char** argv) {
 
 	// Init swapchain
 	{
+		glfwCreateWindowSurface(g_vkInstance, g_window, nullptr, &g_vkSurface);
+
+		std::vector<VkBool32> supportsPresent(g_vkQueueProperties.size());
+
+		for (uint32_t i = 0; i < g_vkQueueProperties.size(); ++i)
+			g_vkFPGetPhysicalDeviceSurfaceSupportKHR(g_vkGPU, i, g_vkSurface, &supportsPresent[i]);
+
+		uint32_t graphicsQueueNodeIndex = UINT32_MAX;
+		uint32_t presentQueueNodeIndex = UINT32_MAX;
+
+		for (uint32_t i = 0; i < g_vkQueueProperties.size(); ++i) {
+			if (graphicsQueueNodeIndex == UINT32_MAX) {
+				graphicsQueueNodeIndex = i;
+			}
+
+			if (supportsPresent[i] == VK_TRUE) {
+				graphicsQueueNodeIndex = i;
+				presentQueueNodeIndex = i;
+				break;
+			}
+		}
+
+		//if (presentQueueNodeIndex == UINT32_MAX) {
+		//	for (uint32_t i = 0; i < g_vkQueueProperties.size(); ++i) {
+		//		if (supportsPresent[i] == VK_TRUE) {
+		//			presentQueueNodeIndex = i;
+		//		}
+		//	}
+		//}
+
+		if (graphicsQueueNodeIndex == UINT32_MAX || presentQueueNodeIndex == UINT32_MAX)
+			error("Could not find a graphics and a present queue.");
+
+		if (graphicsQueueNodeIndex != presentQueueNodeIndex)
+			error("Could not find a common graphics and present queue.");
+
+		g_vkGraphicsQueueNodeIndex = graphicsQueueNodeIndex;
+
+		//TODO: init device
+		{
+			float queuePriotities = 0.f;
+			VkDeviceQueueCreateInfo queue;
+			{
+				queue.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+				queue.pNext = NULL;
+				queue.queueFamilyIndex = g_vkGraphicsQueueNodeIndex;
+				queue.queueCount = 1;
+				queue.pQueuePriorities = &queuePriotities;
+			}
+
+		}
+
+		//vkGetDeviceQueue(g_vkDevice, g_vkGraphicsQueueNodeIndex, 0, g_vkQueue);
 
 	}
 
